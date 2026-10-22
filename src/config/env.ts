@@ -39,6 +39,12 @@ const sameSite = process.env.COOKIE_SAME_SITE ?? (process.env.NODE_ENV === "prod
 if (!["lax", "strict", "none"].includes(sameSite)) {
   throw new Error("COOKIE_SAME_SITE must be lax, strict, or none");
 }
+const clientUrl = (process.env.CLIENT_URL ?? "http://localhost:3000").trim().replace(/\/+$/, "");
+try {
+  new URL(clientUrl);
+} catch {
+  throw new Error("CLIENT_URL must be a valid frontend origin");
+}
 
 export const env = {
   port,
@@ -47,7 +53,7 @@ export const env = {
   jwtSecret: required("JWT_SECRET"),
   accessTokenExpiresInSeconds,
   refreshTokenExpiresInSeconds,
-  clientUrl: process.env.CLIENT_URL ?? "http://localhost:3000",
+  clientUrl,
   isProd: process.env.NODE_ENV === "production",
   cookieDomain: process.env.COOKIE_DOMAIN?.trim() || undefined,
   cookieSameSite: sameSite as "lax" | "strict" | "none",

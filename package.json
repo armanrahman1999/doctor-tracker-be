@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/main.js",
     "seed": "tsx src/scripts/seed.ts",
+    "seed:demo": "tsx src/scripts/seedDemo.ts",
     "test": "vitest run"
   },
   "keywords": [],

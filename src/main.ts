@@ -4,6 +4,11 @@ import cookieParser from "cookie-parser";
 import { env } from "./config/env";
 import { connectMongo, disconnectMongo } from "./infrastructure/database/mongo";
 import authRoutes from "./routes/auth.routes";
+import { authenticate , authorize } from "./middleware/auth";
+import doctorRoutes from "./routes/doctor.route";
+import patientRoutes from "./routes/patient.route";
+import dashboardRoutes from "./routes/dashboard.route";
+
 
 const bootstrap = async () => {
   await connectMongo(env.mongoUri);
@@ -15,9 +20,9 @@ const bootstrap = async () => {
 
   app.get("/health", (_req, res) => res.json({ status: "ok" }));
   app.use("/api/auth", authRoutes);
-
-  // Later: app.use("/api/doctors", authenticate, doctorRoutes);
-
+  app.use("/api/doctors", authenticate, doctorRoutes);
+  app.use("/api/patients", authenticate, patientRoutes);  
+app.use("/api/dashboard", authenticate, authorize("admin"), dashboardRoutes);
   // Catches any unexpected error so the server doesn't crash
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     console.error(err);

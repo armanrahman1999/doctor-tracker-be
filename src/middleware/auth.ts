@@ -6,15 +6,15 @@ export interface AuthRequest extends Request {
   user?: { id: string; role: string };
 }
 
-// Blocks the request unless the user has a valid login cookie
+// API authorization is always enforced here; proxy redirects are only a UX convenience.
 export const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
-  const token = req.cookies?.[env.cookieName];
+  const token = req.cookies?.access_token;
   if (!token) return res.status(401).json({ success: false, message: "Not authenticated" });
 
   try {
     const payload = jwt.verify(token, env.jwtSecret);
     if (typeof payload === "string" || typeof payload.id !== "string" ||
-      typeof payload.role !== "string") {
+      typeof payload.role !== "string" || payload.tokenType !== "access") {
       return res.status(401).json({ success: false, message: "Invalid or expired token" });
     }
     req.user = { id: payload.id, role: payload.role };

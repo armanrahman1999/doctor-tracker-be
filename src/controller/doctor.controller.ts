@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { AuthRequest } from "../middleware/auth";
 import { Doctor } from "../models/Doctors";
+import { isValidObjectId } from "mongoose";
 
 const createSchema = z.object({
   name: z.string().trim().min(2),
@@ -69,6 +70,9 @@ export const listDoctors = async (req: AuthRequest, res: Response) => {
 };
 
 export const getDoctor = async (req: AuthRequest, res: Response) => {
+  if (!isValidObjectId(req.params.id)) {
+    return res.status(400).json({ error: "Invalid doctor id" });
+  }
   const doctor = await Doctor.findById(req.params.id).lean();
   if (!doctor) return res.status(404).json({ error: "Doctor not found" });
   res.json(doctor);

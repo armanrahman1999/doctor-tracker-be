@@ -1,104 +1,87 @@
 import { Response } from "express";
-
 import { AuthRequest } from "../middleware/auth";
 import { Doctor } from "../models/Doctors";
 import { Patient } from "../models/Patients";
+import { sendSuccess } from "../utils/api";
 
-export const getStats = async (req: AuthRequest, res: Response) => {
-  // Date range for the "over time" chart. Default: last 30 days
-  const days = Math.min(Math.max(parseInt(req.query.days as string) || 30, 1), 365);
-  const since = new Date();
-  since.setDate(since.getDate() - days + 1);
-  since.setHours(0, 0, 0, 0);
+const conditions = ["Stable", "Moderate", "Critical"] as const;
 
-  const [totalDoctors, patientStats, specializations] = await Promise.all([
+export const getStats = async (_req: AuthRequest, res: Response) => {
+  const today = new Date();
+  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1));
+  const start = new Date(end);
+  start.setUTCDate(start.getUTCDate() - 30);
+
+  const [totalDoctors, [aggregate]] = await Promise.all([
     Doctor.countDocuments(),
-
-    // One round trip to MongoDB for all patient stats
     Patient.aggregate([
       {
         $facet: {
           total: [{ $count: "count" }],
-
-          perDoctor: [
-            { $group: { _id: "$doctorId", count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
+          critical: [{ $match: { condition: "Critical" } }, { $count: "count" }],
+          conditions: [
+            { $group: { _id: "$condition", count: { $sum: 1 } } },
+            { $project: { _id: 0, condition: "$_id", count: 1 } },
+          ],
+          patientsPerDoctor: [
+            { $group: { _id: "$doctorId", patientCount: { $sum: 1 } } },
+            { $sort: { patientCount: -1, _id: 1 } },
             { $limit: 10 },
             {
               $lookup: {
-                from: "doctors",
+                from: Doctor.collection.name,
                 localField: "_id",
                 foreignField: "_id",
                 as: "doctor",
               },
             },
             { $unwind: "$doctor" },
-            { $project: { _id: 0, doctorId: "$_id", doctor: "$doctor.name", count: 1 } },
+            { $project: { _id: 0, doctorName: "$doctor.name", patientCount: 1 } },
           ],
-
-          overTime: [
-            { $match: { admittedAt: { $gte: since } } },
+          patientGrowth: [
+            { $match: { createdAt: { $gte: start, $lt: end } } },
             {
               $group: {
-                _id: { $dateToString: { format: "%Y-%m-%d", date: "$admittedAt" } },
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
                 count: { $sum: 1 },
               },
             },
             { $sort: { _id: 1 } },
             { $project: { _id: 0, date: "$_id", count: 1 } },
           ],
-
-          byCondition: [
-            { $group: { _id: "$condition", count: { $sum: 1 } } },
-            { $sort: { count: -1 } },
-            { $limit: 10 },
-            { $project: { _id: 0, condition: "$_id", count: 1 } },
-          ],
-
-          byStatus: [
-            { $group: { _id: "$status", count: { $sum: 1 } } },
-            { $project: { _id: 0, status: "$_id", count: 1 } },
-          ],
         },
       },
     ]),
-
-    Doctor.aggregate([
-      { $group: { _id: "$specialization", count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $project: { _id: 0, specialization: "$_id", count: 1 } },
-    ]),
   ]);
 
-  const stats = patientStats[0];
+  const totalPatients = aggregate?.total[0]?.count ?? 0;
+  const conditionCounts = new Map<string, number>(
+    (aggregate?.conditions ?? []).map((item: { condition: string; count: number }) =>
+      [item.condition, item.count])
+  );
+  const growth = new Map<string, number>(
+    (aggregate?.patientGrowth ?? []).map((item: { date: string; count: number }) =>
+      [item.date, item.count])
+  );
+  const patientGrowth = Array.from({ length: 30 }, (_, index) => {
+    const date = new Date(start);
+    date.setUTCDate(start.getUTCDate() + index);
+    const key = date.toISOString().slice(0, 10);
+    return { date: key, count: growth.get(key) ?? 0 };
+  });
 
-  res.json({
-    totals: {
-      doctors: totalDoctors,
-      patients: stats.total[0]?.count ?? 0,
+  return sendSuccess(res, "Dashboard retrieved successfully", {
+    stats: {
+      totalDoctors,
+      totalPatients,
+      criticalPatients: aggregate?.critical[0]?.count ?? 0,
+      averagePatientsPerDoctor: totalDoctors ? Math.round(totalPatients / totalDoctors) : 0,
     },
-    patientsPerDoctor: stats.perDoctor,
-    patientsOverTime: fillMissingDays(stats.overTime, since, days),
-    patientsByCondition: stats.byCondition,
-    patientsByStatus: stats.byStatus,
-    doctorsBySpecialization: specializations,
+    conditions: conditions.map((condition) => ({
+      condition,
+      count: conditionCounts.get(condition) ?? 0,
+    })),
+    patientsPerDoctor: aggregate?.patientsPerDoctor ?? [],
+    patientGrowth,
   });
 };
-
-// Charts look broken if days with zero patients are missing, so add them as 0
-function fillMissingDays(
-  rows: { date: string; count: number }[],
-  start: Date,
-  days: number
-) {
-  const map = new Map(rows.map((r) => [r.date, r.count]));
-  const result: { date: string; count: number }[] = [];
-
-  for (let i = 0; i < days; i++) {
-    const d = new Date(start);
-    d.setDate(start.getDate() + i);
-    const key = d.toISOString().slice(0, 10);
-    result.push({ date: key, count: map.get(key) ?? 0 });
-  }
-  return result;
-}

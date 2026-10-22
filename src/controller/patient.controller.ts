@@ -1,153 +1,173 @@
 import { Response } from "express";
-import { isValidObjectId, Types } from "mongoose";
+import { isValidObjectId } from "mongoose";
 import { z } from "zod";
-
 import { AuthRequest } from "../middleware/auth";
-import { buildPatientFilter, parsePaging } from "../utils/patientQuery";
-import { Patient } from "../models/Patients";
 import { Doctor } from "../models/Doctors";
+import { Patient } from "../models/Patients";
+import { NotFoundError } from "../shared/AppError";
+import { escapeRegex, getPagination, sendSuccess, sendValidationError, toDateRange } from "../utils/api";
 
-const patientSchema = z.object({
+const patientFields = {
+  doctorId: z.string().refine(isValidObjectId, "Invalid doctor id"),
   name: z.string().trim().min(2),
-  age: z.number().int().min(0).max(130).optional(),
-  gender: z.enum(["male", "female", "other"]).optional(),
-  phone: z.string().trim().optional(),
-  email: z.string().trim().toLowerCase().email().optional(),
-  condition: z.string().trim().min(2),
-  status: z.enum(["active", "recovered", "critical"]).optional(),
-  admittedAt: z.coerce.date().optional(),
+  email: z.string().trim().email().transform((email) => email.toLowerCase()),
+  phone: z.string().trim().min(5),
+  condition: z.enum(["Stable", "Moderate", "Critical"]),
+};
+
+const createSchema = z.object(patientFields);
+const updateSchema = z.object(patientFields).partial()
+  .refine((data) => Object.keys(data).length > 0, "At least one field is required");
+const dateQuery = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "Invalid date");
+const listSchema = z.object({
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  search: z.string().optional(),
+  doctorId: z.string().refine(isValidObjectId, "Invalid doctor id").optional(),
+  condition: z.enum(["Stable", "Moderate", "Critical"]).optional(),
+  from: dateQuery.optional(),
+  to: dateQuery.optional(),
+  sortBy: z.enum(["name", "email", "condition", "createdAt", "updatedAt"]).optional(),
+  sortOrder: z.enum(["asc", "desc"]).optional(),
+}).refine((query) => !query.from || !query.to || new Date(query.from) <= new Date(query.to), {
+  message: "from must be before or equal to to",
+  path: ["from"],
 });
 
-const updateSchema = patientSchema.partial();
-
-const paged = (data: unknown[], total: number, page: number, limit: number) => ({
-  data,
-  meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
+const toPatientDto = (patient: {
+  _id: unknown;
+  doctorId: unknown;
+  name: string;
+  email: string;
+  phone: string;
+  condition: string;
+  createdAt: Date;
+  updatedAt: Date;
+}) => ({
+  id: String(patient._id),
+  doctorId: String(patient.doctorId),
+  name: patient.name,
+  email: patient.email,
+  phone: patient.phone,
+  condition: patient.condition,
+  createdAt: patient.createdAt.toISOString(),
+  updatedAt: patient.updatedAt.toISOString(),
 });
 
-// ---------- Patients page ----------
+const listForDoctor = async (req: AuthRequest, res: Response, doctorId?: string) => {
+  const parsed = listSchema.safeParse({
+    ...req.query,
+    ...(doctorId ? { doctorId } : {}),
+  });
+  if (!parsed.success) return sendValidationError(res, parsed.error);
 
-export const listPatients = async (req: AuthRequest, res: Response) => {
-  const { page, limit } = parsePaging(req.query);
-  const filter = buildPatientFilter(req.query);
+  const query = parsed.data;
+  const page = query.page ?? 1;
+  const limit = query.limit ?? 10;
+  const filter: Record<string, unknown> = {};
+  if (query.doctorId) filter.doctorId = query.doctorId;
+  if (query.condition) filter.condition = query.condition;
+  if (query.search) {
+    const search = new RegExp(escapeRegex(query.search), "i");
+    filter.$or = [{ name: search }, { email: search }, { phone: search }];
+  }
+  const createdAt = toDateRange(query.from, query.to);
+  if (createdAt) filter.createdAt = createdAt;
+  const sortBy = query.sortBy ?? "createdAt";
+  const direction = query.sortOrder === "asc" ? 1 : -1;
 
-  const [data, total] = await Promise.all([
+  const [patients, total] = await Promise.all([
     Patient.find(filter)
-      .populate("doctorId", "name specialization") // show the doctor's name in the table
-      .sort({ admittedAt: -1 })
+      .sort({ [sortBy]: direction, _id: 1 })
       .skip((page - 1) * limit)
       .limit(limit)
       .lean(),
     Patient.countDocuments(filter),
   ]);
+  return sendSuccess(res, doctorId ? "Doctor patients retrieved successfully" : "Patients retrieved successfully", {
+    data: patients.map(toPatientDto),
+    pagination: getPagination(page, limit, total),
+  });
+};
 
-  res.json(paged(data, total, page, limit));
+export const listPatients = (req: AuthRequest, res: Response) => listForDoctor(req, res);
+
+export const getPatient = async (req: AuthRequest, res: Response) => {
+  const { patientId } = req.params;
+  if (!isValidObjectId(patientId)) {
+    return res.status(400).json({ success: false, message: "Invalid patient id" });
+  }
+  const patient = await Patient.findById(patientId).lean();
+  if (!patient) throw new NotFoundError("Patient not found");
+  return sendSuccess(res, "Patient retrieved successfully", toPatientDto(patient));
+};
+
+const createPatient = async (doctorId: string, req: AuthRequest, res: Response) => {
+  const parsed = createSchema.safeParse({ ...req.body, doctorId: doctorId || req.body?.doctorId });
+  if (!parsed.success) return sendValidationError(res, parsed.error);
+  if (!await Doctor.exists({ _id: parsed.data.doctorId })) {
+    throw new NotFoundError("Doctor not found");
+  }
+
+  const patient = await Patient.create(parsed.data);
+  return sendSuccess(res, "Patient created successfully", toPatientDto(patient), 201);
+};
+
+export const addPatient = (req: AuthRequest, res: Response) => createPatient("", req, res);
+
+export const addPatientToDoctor = (req: AuthRequest, res: Response) => {
+  const { doctorId } = req.params;
+  if (typeof doctorId !== "string" || !isValidObjectId(doctorId)) {
+    return res.status(400).json({ success: false, message: "Invalid doctor id" });
+  }
+  return createPatient(doctorId, req, res);
 };
 
 export const updatePatient = async (req: AuthRequest, res: Response) => {
-  if (!isValidObjectId(req.params.id)) {
-    return res.status(400).json({ error: "Invalid patient id" });
+  const { patientId } = req.params;
+  if (typeof patientId !== "string" || !isValidObjectId(patientId)) {
+    return res.status(400).json({ success: false, message: "Invalid patient id" });
   }
-
   const parsed = updateSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "Validation failed", details: parsed.error.issues });
+  if (!parsed.success) return sendValidationError(res, parsed.error);
+  if (parsed.data.doctorId && !await Doctor.exists({ _id: parsed.data.doctorId })) {
+    throw new NotFoundError("Doctor not found");
   }
 
-  const patient = await Patient.findByIdAndUpdate(req.params.id, parsed.data, {
+  const patient = await Patient.findByIdAndUpdate(patientId, parsed.data, {
     new: true,
     runValidators: true,
   }).lean();
-
-  if (!patient) return res.status(404).json({ error: "Patient not found" });
-  res.json(patient);
+  if (!patient) throw new NotFoundError("Patient not found");
+  return sendSuccess(res, "Patient updated successfully", toPatientDto(patient));
 };
 
 export const deletePatient = async (req: AuthRequest, res: Response) => {
-  if (!isValidObjectId(req.params.id)) {
-    return res.status(400).json({ error: "Invalid patient id" });
+  const { patientId } = req.params;
+  if (typeof patientId !== "string" || !isValidObjectId(patientId)) {
+    return res.status(400).json({ success: false, message: "Invalid patient id" });
   }
-
-  const patient = await Patient.findByIdAndDelete(req.params.id);
-  if (!patient) return res.status(404).json({ error: "Patient not found" });
-
-  await Doctor.findByIdAndUpdate(patient.doctorId, { $inc: { patientCount: -1 } });
-  res.status(204).send();
+  const patient = await Patient.findByIdAndDelete(patientId);
+  if (!patient) throw new NotFoundError("Patient not found");
+  return sendSuccess(res, "Patient deleted successfully", null);
 };
-
-// ---------- Under a doctor ----------
 
 export const listDoctorPatients = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
-  if (typeof id !== "string" || !isValidObjectId(id)) {
-    return res.status(400).json({ error: "Invalid doctor id" });
+  const { doctorId } = req.params;
+  if (typeof doctorId !== "string" || !isValidObjectId(doctorId)) {
+    return res.status(400).json({ success: false, message: "Invalid doctor id" });
   }
-  const doctorId = new Types.ObjectId(id);
-
-  const doctorExists = await Doctor.exists({ _id: doctorId });
-  if (!doctorExists) return res.status(404).json({ error: "Doctor not found" });
-
-  const { page, limit } = parsePaging(req.query);
-  const filter = { ...buildPatientFilter(req.query), doctorId };
-
-  const [data, total] = await Promise.all([
-    Patient.find(filter)
-      .sort({ admittedAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    Patient.countDocuments(filter),
-  ]);
-
-  res.json(paged(data, total, page, limit));
-};
-
-export const addPatientToDoctor = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
-  if (!isValidObjectId(id)) return res.status(400).json({ error: "Invalid doctor id" });
-
-  const parsed = patientSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "Validation failed", details: parsed.error.issues });
-  }
-
-  const doctor = await Doctor.findById(id);
-  if (!doctor) return res.status(404).json({ error: "Doctor not found" });
-
-  const patient = await Patient.create({
-    name: parsed.data.name,
-    condition: parsed.data.condition,
-    doctorId: doctor._id,
-    ...(parsed.data.age !== undefined ? { age: parsed.data.age } : {}),
-    ...(parsed.data.gender !== undefined ? { gender: parsed.data.gender } : {}),
-    ...(parsed.data.phone !== undefined ? { phone: parsed.data.phone } : {}),
-    ...(parsed.data.email !== undefined ? { email: parsed.data.email } : {}),
-    ...(parsed.data.status !== undefined ? { status: parsed.data.status } : {}),
-    ...(parsed.data.admittedAt !== undefined ? { admittedAt: parsed.data.admittedAt } : {}),
-  });
-  await Doctor.findByIdAndUpdate(doctor._id, { $inc: { patientCount: 1 } });
-
-  res.status(201).json(patient);
+  if (!await Doctor.exists({ _id: doctorId })) throw new NotFoundError("Doctor not found");
+  return listForDoctor(req, res, doctorId);
 };
 
 export const removePatientFromDoctor = async (req: AuthRequest, res: Response) => {
-  const { id, patientId } = req.params;
-  if (
-    typeof id !== "string" ||
-    typeof patientId !== "string" ||
-    !isValidObjectId(id) ||
-    !isValidObjectId(patientId)
-  ) {
-    return res.status(400).json({ error: "Invalid id" });
+  const { doctorId, patientId } = req.params;
+  if (typeof doctorId !== "string" || typeof patientId !== "string" ||
+    !isValidObjectId(doctorId) || !isValidObjectId(patientId)) {
+    return res.status(400).json({ success: false, message: "Invalid id" });
   }
-
-  const doctorId = new Types.ObjectId(id);
-  const patientObjectId = new Types.ObjectId(patientId);
-
-  // Match both ids so you can't delete a patient through the wrong doctor
-  const patient = await Patient.findOneAndDelete({ _id: patientObjectId, doctorId });
-  if (!patient) return res.status(404).json({ error: "Patient not found for this doctor" });
-
-  await Doctor.findByIdAndUpdate(doctorId, { $inc: { patientCount: -1 } });
-  res.status(204).send();
+  const patient = await Patient.findOneAndDelete({ _id: patientId, doctorId });
+  if (!patient) throw new NotFoundError("Patient not found for this doctor");
+  return sendSuccess(res, "Patient deleted successfully", null);
 };

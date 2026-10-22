@@ -5,10 +5,8 @@ import { Doctor } from "../models/Doctors";
 
 const specs = ["Cardiology", "Neurology", "Orthopedics", "Pediatrics", "Dermatology"];
 const hospitals = ["Square Hospital", "United Hospital", "Evercare", "Labaid"];
-const conditions = ["Diabetes", "Hypertension", "Fracture", "Asthma", "Migraine", "Fever"];
-const statuses = ["active", "active", "active", "recovered", "critical"];
-const genders = ["male", "female", "other"];
-const pick = <T,>(arr: T[]): T => {
+const conditions = ["Stable", "Moderate", "Critical"] as const;
+const pick = <T,>(arr: readonly T[]): T => {
   const value = arr[Math.floor(Math.random() * arr.length)];
   if (value === undefined) throw new Error("Cannot pick from an empty array");
   return value;
@@ -30,27 +28,18 @@ const run = async () => {
     }))
   );
 
-  const counts = new Map<string, number>();
   const patients = Array.from({ length: 150 }, (_, i) => {
     const doctor = pick(doctors);
-    counts.set(doctor.id, (counts.get(doctor.id) ?? 0) + 1);
-    const daysAgo = Math.floor(Math.random() * 30);
     return {
       name: `Patient ${i + 1}`,
-      age: 5 + Math.floor(Math.random() * 80),
-      gender: pick(genders),
+      email: `patient${i + 1}@example.com`,
+      phone: `+1 403 555 ${String(1000 + i).padStart(4, "0")}`,
       condition: pick(conditions),
-      status: pick(statuses),
       doctorId: doctor._id,
-      admittedAt: new Date(Date.now() - daysAgo * 86400000),
+      createdAt: new Date(Date.now() - Math.floor(Math.random() * 30) * 86400000),
     };
   });
   await Patient.insertMany(patients);
-
-  // Keep the denormalized counter correct
-  for (const [id, count] of counts) {
-    await Doctor.findByIdAndUpdate(id, { patientCount: count });
-  }
 
   console.log("Demo data created: 12 doctors, 150 patients");
   await disconnectMongo();

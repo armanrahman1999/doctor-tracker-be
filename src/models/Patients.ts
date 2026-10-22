@@ -1,24 +1,32 @@
-import { Schema, model } from "mongoose";
+import { Schema, Types, model } from "mongoose";
 
-const patientSchema = new Schema(
+export type PatientCondition = "Stable" | "Moderate" | "Critical";
+
+export interface PatientRecord {
+  name: string;
+  email: string;
+  phone: string;
+  condition: PatientCondition;
+  doctorId: Types.ObjectId;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const patientSchema = new Schema<PatientRecord>(
   {
     name: { type: String, required: true, trim: true },
-    age: { type: Number, min: 0, max: 130 },
-    gender: { type: String, enum: ["male", "female", "other"] },
-    phone: { type: String, trim: true },
-    email: { type: String, trim: true, lowercase: true },
-    condition: { type: String, required: true, trim: true },
-    status: { type: String, enum: ["active", "recovered", "critical"], default: "active" },
+    email: { type: String, required: true, trim: true, lowercase: true },
+    phone: { type: String, required: true, trim: true },
+    condition: { type: String, required: true, enum: ["Stable", "Moderate", "Critical"] },
     doctorId: { type: Schema.Types.ObjectId, ref: "Doctor", required: true },
-    admittedAt: { type: Date, default: Date.now },
   },
   { timestamps: true }
 );
 
 // Indexes for fast lists, filters, search and dashboard stats
 patientSchema.index({ doctorId: 1, createdAt: -1 });
-patientSchema.index({ condition: 1, status: 1 });
-patientSchema.index({ admittedAt: -1 });
-patientSchema.index({ name: "text", condition: "text" });
+patientSchema.index({ doctorId: 1 });
+patientSchema.index({ condition: 1 });
+patientSchema.index({ createdAt: -1 });
 
-export const Patient = model("Patient", patientSchema);
+export const Patient = model<PatientRecord>("Patient", patientSchema);

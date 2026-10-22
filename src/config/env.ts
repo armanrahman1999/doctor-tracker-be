@@ -11,6 +11,11 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT must be a valid TCP port");
 }
 
+const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS ?? 0);
+if (!Number.isInteger(trustProxyHops) || trustProxyHops < 0) {
+  throw new Error("TRUST_PROXY_HOPS must be a non-negative integer");
+}
+
 const parseDurationSeconds = (name: string, value: string): number => {
   const durationMatch = /^(\d+)([smhd])$/.exec(value);
   if (!durationMatch) throw new Error(`${name} must be a duration such as 15m or 7d`);
@@ -37,6 +42,7 @@ if (!["lax", "strict", "none"].includes(sameSite)) {
 
 export const env = {
   port,
+  trustProxyHops,
   mongoUri: required("MONGODB_URI", "MONGO_URI"),
   jwtSecret: required("JWT_SECRET"),
   accessTokenExpiresInSeconds,

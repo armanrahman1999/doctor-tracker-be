@@ -17,12 +17,20 @@ const bootstrap = async () => {
   await connectMongo(env.mongoUri);
 
   const app = express();
+  if (env.trustProxyHops > 0) app.set("trust proxy", env.trustProxyHops);
   app.use(helmet());
   app.use(cors({ origin: env.clientUrl, credentials: true }));
   app.use(express.json({ limit: "1mb" }));
   app.use(cookieParser());
 
   app.get("/api/v1/health", (_req, res) => sendSuccess(res, "API is healthy", { status: "ok" }));
+  app.use("/api/v1", rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: "Too many requests. Please try again later." },
+  }));
   app.use("/api/v1/auth/login", rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 10,

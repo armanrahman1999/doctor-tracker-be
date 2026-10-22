@@ -1,16 +1,102 @@
 import { Response } from "express";
+import { z } from "zod";
 import { AuthRequest } from "../middleware/auth";
 import { Doctor } from "../models/Doctors";
 import { Patient } from "../models/Patients";
 import { sendSuccess } from "../utils/api";
 
 const conditions = ["Stable", "Moderate", "Critical"] as const;
+const growthQuerySchema = z.object({
+  growthPeriod: z.enum(["7d", "30d", "90d", "6m", "1y", "all"]).default("6m"),
+  growthInterval: z.enum(["day", "month", "year"]).default("month"),
+});
 
-export const getStats = async (_req: AuthRequest, res: Response) => {
-  const today = new Date();
-  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 1));
-  const start = new Date(end);
-  start.setUTCDate(start.getUTCDate() - 30);
+type GrowthInterval = z.infer<typeof growthQuerySchema>["growthInterval"];
+
+const floorToInterval = (date: Date, interval: GrowthInterval) => {
+  const result = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  if (interval === "month") result.setUTCDate(1);
+  if (interval === "year") {
+    result.setUTCMonth(0, 1);
+  }
+  return result;
+};
+
+const addInterval = (date: Date, interval: GrowthInterval) => {
+  const result = new Date(date);
+  if (interval === "day") result.setUTCDate(result.getUTCDate() + 1);
+  if (interval === "month") result.setUTCMonth(result.getUTCMonth() + 1);
+  if (interval === "year") result.setUTCFullYear(result.getUTCFullYear() + 1);
+  return result;
+};
+
+const intervalFormat: Record<GrowthInterval, string> = {
+  day: "%Y-%m-%d",
+  month: "%Y-%m",
+  year: "%Y",
+};
+
+const formatInterval = (date: Date, interval: GrowthInterval) => {
+  const year = String(date.getUTCFullYear()).padStart(4, "0");
+  if (interval === "year") return year;
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  if (interval === "month") return `${year}-${month}`;
+  return `${year}-${month}-${String(date.getUTCDate()).padStart(2, "0")}`;
+};
+
+const getGrowthRange = (
+  period: z.infer<typeof growthQuerySchema>["growthPeriod"],
+  interval: GrowthInterval,
+  now: Date,
+  earliestPatientDate?: Date,
+) => {
+  const currentBucket = floorToInterval(now, interval);
+  const currentDay = floorToInterval(now, "day");
+  let start: Date;
+  let end: Date;
+
+  // Periods include the current UTC day; the query range is [start, end).
+  if (period === "all") {
+    start = earliestPatientDate ? floorToInterval(earliestPatientDate, interval) : currentBucket;
+    end = addInterval(currentBucket, interval);
+  } else if (period.endsWith("d")) {
+    const days = Number(period.slice(0, -1));
+    start = new Date(currentDay);
+    start.setUTCDate(start.getUTCDate() - days + 1);
+    end = addInterval(currentDay, "day");
+  } else {
+    const months = period === "6m" ? 6 : 12;
+    start = new Date(Date.UTC(
+      currentBucket.getUTCFullYear(),
+      currentBucket.getUTCMonth() - months + 1,
+      1,
+    ));
+    end = addInterval(currentDay, "day");
+  }
+
+  return { start, end, firstBucket: floorToInterval(start, interval) };
+};
+
+export const getStats = async (req: AuthRequest, res: Response) => {
+  const parsed = growthQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid dashboard growth filters",
+      errors: parsed.error.flatten().fieldErrors,
+    });
+  }
+  const { growthPeriod, growthInterval } = parsed.data;
+  const now = new Date();
+  const earliestPatient = growthPeriod === "all"
+    ? await Patient.findOne().sort({ createdAt: 1 }).select({ createdAt: 1 }).lean()
+    : null;
+  const { start, end, firstBucket } = getGrowthRange(
+    growthPeriod,
+    growthInterval,
+    now,
+    earliestPatient?.createdAt,
+  );
 
   const [totalDoctors, [aggregate]] = await Promise.all([
     Doctor.countDocuments(),
@@ -42,7 +128,13 @@ export const getStats = async (_req: AuthRequest, res: Response) => {
             { $match: { createdAt: { $gte: start, $lt: end } } },
             {
               $group: {
-                _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: "UTC" } },
+                _id: {
+                  $dateToString: {
+                    format: intervalFormat[growthInterval],
+                    date: "$createdAt",
+                    timezone: "UTC",
+                  },
+                },
                 count: { $sum: 1 },
               },
             },
@@ -59,16 +151,15 @@ export const getStats = async (_req: AuthRequest, res: Response) => {
     (aggregate?.conditions ?? []).map((item: { condition: string; count: number }) =>
       [item.condition, item.count])
   );
-  const growth = new Map<string, number>(
+  const growthCounts = new Map<string, number>(
     (aggregate?.patientGrowth ?? []).map((item: { date: string; count: number }) =>
       [item.date, item.count])
   );
-  const patientGrowth = Array.from({ length: 30 }, (_, index) => {
-    const date = new Date(start);
-    date.setUTCDate(start.getUTCDate() + index);
-    const key = date.toISOString().slice(0, 10);
-    return { date: key, count: growth.get(key) ?? 0 };
-  });
+  const patientGrowth: { date: string; count: number }[] = [];
+  for (let date = new Date(firstBucket); date < end; date = addInterval(date, growthInterval)) {
+    const key = formatInterval(date, growthInterval);
+    patientGrowth.push({ date: key, count: growthCounts.get(key) ?? 0 });
+  }
 
   return sendSuccess(res, "Dashboard retrieved successfully", {
     stats: {
